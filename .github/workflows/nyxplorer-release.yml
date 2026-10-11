@@ -1,0 +1,235 @@
+# Builds Nyxplorer from an upstream Files release tag, applies the Nyxplorer branding overlay, and publishes
+# Nyxplorer-Setup.exe plus in-app update files to this repository's GitHub Releases.
+
+name: Nyxplorer Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream Files tag or branch to build (blank = latest upstream stable release)'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish a GitHub Release (off = build and upload artifacts only)'
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      upstream_ref:
+        type: string
+        default: ''
+      publish:
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nyxplorer-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    env:
+      CONFIGURATION: Release
+      PLATFORM: x64
+      NYXPLORER_DIR: '${{ github.workspace }}\nyxplorer-repo'
+      SOURCE_DIR: '${{ github.workspace }}\upstream'
+      OUT_DIR: '${{ github.workspace }}\out'
+      APPX_PACKAGE_DIR: '${{ github.workspace }}\out\AppxPackages\'
+      PFX_PATH: '${{ github.workspace }}\nyxplorer-signing.pfx'
+
+    steps:
+    - name: Checkout Nyxplorer
+      uses: actions/checkout@v6
+      with:
+        path: nyxplorer-repo
+
+    - name: Resolve upstream ref
+      id: ref
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_REF: ${{ inputs.upstream_ref }}
+      run: |
+        $config = Get-Content "$env:NYXPLORER_DIR\nyxplorer\nyxplorer.config.json" -Raw | ConvertFrom-Json
+        $ref = $env:INPUT_REF
+        if (-not $ref) { $ref = gh api "repos/$($config.upstreamRepository)/releases/latest" --jq .tag_name }
+        if (-not $ref) { throw "Could not resolve the latest upstream release" }
+        "ref=$ref" >> $env:GITHUB_OUTPUT
+        "upstream=$($config.upstreamRepository)" >> $env:GITHUB_OUTPUT
+        Write-Host "Building upstream $($config.upstreamRepository)@$ref"
+
+    - name: Checkout upstream Files
+      uses: actions/checkout@v6
+      with:
+        repository: ${{ steps.ref.outputs.upstream }}
+        ref: ${{ steps.ref.outputs.ref }}
+        path: upstream
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v3
+    - name: Setup NuGet
+      uses: NuGet/setup-nuget@v3
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v5
+      with:
+        global-json-file: upstream/global.json
+
+    - name: Setup Node (renders Nyxplorer.svg)
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    # Nyxplorer keeps its own Major.Minor (nyxplorer.config.json) in the same shape as Files: tag vMajor.Minor.Patch,
+    # package Major.Minor.Patch.0. Patch is one past the highest existing release of that Major.Minor.
+    - name: Compute Nyxplorer version
+      id: version
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $config = Get-Content "$env:NYXPLORER_DIR\nyxplorer\nyxplorer.config.json" -Raw | ConvertFrom-Json
+        $base = [version]$config.version
+        $prefix = "v$($base.Major).$($base.Minor)."
+        $tags = gh release list -R "${{ github.repository }}" --limit 1000 --json tagName --jq '.[].tagName'
+        if ($LASTEXITCODE -ne 0) { throw "Could not list existing releases" }
+        $patch = 0
+        foreach ($tag in $tags) {
+          $n = 0
+          if ($tag.StartsWith($prefix) -and [int]::TryParse($tag.Substring($prefix.Length), [ref]$n) -and $n -ge $patch) { $patch = $n + 1 }
+        }
+        $display = "$($base.Major).$($base.Minor).$patch"
+        "version=$display.0" >> $env:GITHUB_OUTPUT
+        "display=$display" >> $env:GITHUB_OUTPUT
+        "tag=v$display" >> $env:GITHUB_OUTPUT
+        Write-Host "Nyxplorer version $display (package $display.0)"
+
+    - name: Apply Nyxplorer branding
+      shell: pwsh
+      run: |
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Apply-NyxplorerBranding.ps1" `
+          -SourceRoot "$env:SOURCE_DIR" `
+          -Version "${{ steps.version.outputs.version }}"
+
+    - name: Load signing certificate
+      shell: pwsh
+      env:
+        NYXPLORER_CERT_PFX: ${{ secrets.NYXPLORER_CERT_PFX }}
+      run: |
+        if (-not $env:NYXPLORER_CERT_PFX) { throw "Secret NYXPLORER_CERT_PFX is missing. Run nyxplorer/scripts/New-NyxplorerCertificate.ps1 once (see README)." }
+        [IO.File]::WriteAllBytes($env:PFX_PATH, [Convert]::FromBase64String($env:NYXPLORER_CERT_PFX))
+
+    - name: Restore
+      shell: pwsh
+      working-directory: upstream
+      run: |
+        msbuild Files.slnx -t:Restore -p:Platform=$env:PLATFORM -p:Configuration=$env:CONFIGURATION -p:PublishReadyToRun=true -v:quiet
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        nuget restore "src\Files.App.Launcher\Files.App.Launcher.vcxproj" -SolutionDirectory "$env:SOURCE_DIR" -Verbosity quiet
+
+    - name: Build launcher
+      shell: pwsh
+      working-directory: upstream
+      run: |
+        msbuild "src\Files.App.Launcher\Files.App.Launcher.vcxproj" -t:Build -p:Platform=$env:PLATFORM -p:Configuration=$env:CONFIGURATION -v:quiet
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $launchers = Get-ChildItem "src\Files.App\Assets\FilesOpenDialog" -Filter *.exe | ForEach-Object FullName
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $launchers -PfxPath $env:PFX_PATH -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}"
+
+    - name: Build and package Nyxplorer
+      shell: pwsh
+      working-directory: upstream
+      run: |
+        msbuild "src\Files.App\Files.App.csproj" `
+          -t:Build `
+          -p:Platform=$env:PLATFORM `
+          -p:Configuration=$env:CONFIGURATION `
+          -p:AppxPackageDir="$env:APPX_PACKAGE_DIR" `
+          -p:AppxBundle=Never `
+          -p:GenerateAppxPackageOnBuild=true `
+          -p:UapAppxPackageBuildMode=Sideload `
+          -p:AppxPackageSigningEnabled=false `
+          -v:quiet
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - name: Create and sign msixbundle
+      shell: pwsh
+      working-directory: upstream
+      run: |
+        . '.\.github\scripts\Create-MsixBundle.ps1' `
+          -AppxPackageDir "$env:APPX_PACKAGE_DIR" `
+          -BundleName "Nyxplorer" `
+          -PackageManifestPath "src\Files.App\Package.appxmanifest" `
+          -BuildMode "SideloadOnly"
+        $bundle = Get-ChildItem "$env:APPX_PACKAGE_DIR" -Recurse -Filter *.msixbundle | Select-Object -First 1
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $bundle.FullName -PfxPath $env:PFX_PATH -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}"
+
+    - name: Collect release files
+      shell: pwsh
+      run: |
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\New-NyxplorerReleaseFiles.ps1" `
+          -SourceRoot "$env:SOURCE_DIR" `
+          -AppxPackageDir "$env:APPX_PACKAGE_DIR" `
+          -PfxPath "$env:PFX_PATH" `
+          -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}" `
+          -OutDir "$env:OUT_DIR" `
+          -Version "${{ steps.version.outputs.version }}" `
+          -Tag "${{ steps.version.outputs.tag }}" `
+          -Repository "${{ github.repository }}"
+
+    - name: Build Nyxplorer-Setup.exe
+      shell: pwsh
+      run: |
+        choco install innosetup -y --no-progress | Out-Null
+        $iscc = Get-ChildItem "${env:ProgramFiles(x86)}", "$env:ProgramFiles", "$env:LOCALAPPDATA\Programs" -Filter ISCC.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+          Select-Object -First 1 -ExpandProperty FullName
+        if (-not $iscc) { throw "Inno Setup compiler (ISCC.exe) not found" }
+        $art = "$env:OUT_DIR\installer-art"
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\New-NyxplorerInstallerImages.ps1" -OutDir $art
+        & $iscc `
+          "/DWizardSmallImages=$(Get-Content "$art\small.txt" -Raw)" `
+          "/DWizardLargeImages=$(Get-Content "$art\large.txt" -Raw)" `
+          "/DAppVersion=${{ steps.version.outputs.version }}" `
+          "/DPayloadDir=$env:OUT_DIR\payload" `
+          "/DLicenseFile=$env:OUT_DIR\license.txt" `
+          "/DIconFile=$env:SOURCE_DIR\src\Files.App\Assets\AppTiles\Release\Logo.ico" `
+          "/DOutputDir=$env:OUT_DIR\release" `
+          "$env:NYXPLORER_DIR\nyxplorer\installer\Nyxplorer.iss"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $setup = Get-ChildItem "$env:OUT_DIR\release" -Filter "Nyxplorer-Setup-*.exe" | ForEach-Object FullName
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $setup -PfxPath $env:PFX_PATH -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: 'Nyxplorer ${{ steps.version.outputs.version }}'
+        path: ${{ env.OUT_DIR }}\release
+
+    - name: Publish GitHub Release
+      if: ${{ inputs.publish }}
+      shell: pwsh
+      working-directory: nyxplorer-repo
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $notes = @"
+        Nyxplorer ${{ steps.version.outputs.display }}, based on [Files ${{ steps.ref.outputs.ref }}](https://github.com/${{ steps.ref.outputs.upstream }}/releases/tag/${{ steps.ref.outputs.ref }}).
+
+        **Install:** download ``Nyxplorer-Setup-${{ steps.version.outputs.version }}-x64.exe`` and run it.
+        Windows may show *"Windows protected your PC"* because Nyxplorer is signed with its own certificate: choose **More info → Run anyway**.
+
+        Installed copies update themselves from this page. Source for this release: https://github.com/${{ github.repository }}
+        "@
+        gh release create "${{ steps.version.outputs.tag }}" (Get-ChildItem "$env:OUT_DIR\release" | ForEach-Object FullName) `
+          --target "${{ github.sha }}" `
+          --title "Nyxplorer ${{ steps.version.outputs.display }}" `
+          --notes $notes
+
+    - name: Remove signing certificate
+      if: always()
+      shell: pwsh
+      run: Remove-Item $env:PFX_PATH -Force -ErrorAction SilentlyContinue

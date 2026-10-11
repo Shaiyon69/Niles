@@ -1,0 +1,3 @@
+# Signing material (see nyxplorer/scripts/New-NyxplorerCertificate.ps1). Never commit it.
+*.pfx
+*.password.txt

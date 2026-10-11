@@ -1,0 +1,15 @@
+{
+  "name": "Nyxplorer",
+  "packageName": "Nyxplorer",
+  "version": "1.0",
+  "publisher": "CN=Shaiyon69",
+  "publisherDisplayName": "Shaiyon69",
+  "description": "Nyxplorer is a modern file manager by Shaiyon69, based on Files by the Files Community.",
+  "protocol": "nyxplorer",
+  "repository": "Shaiyon69/Nyxplorer",
+  "upstreamRepository": "files-community/Files",
+  "trayIconGuid": "5B1E6A3C-2F4D-4E8A-9C71-0D3A8E5F6B21",
+  "defaultTheme": "Dark",
+  "defaultBackgroundColor": "#FF000000",
+  "defaultBackdrop": "Solid"
+}

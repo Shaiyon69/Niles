@@ -1,0 +1,9 @@
+{
+  "name": "nyxplorer-tools",
+  "private": true,
+  "description": "Build-time helpers for Nyxplorer branding",
+  "type": "module",
+  "dependencies": {
+    "@resvg/resvg-js": "2.6.2"
+  }
+}

@@ -1,0 +1,84 @@
+# Keeps Nyxplorer current with upstream Files. This repo holds only the Nyxplorer overlay; upstream source is checked out at build time.
+#   1. preflight - dry-runs the Nyxplorer branding against upstream main to catch breaking upstream changes early
+#   2. release   - builds and publishes Nyxplorer when upstream ships a stable release Nyxplorer hasn't built yet
+
+name: Nyxplorer Sync
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: nyxplorer-sync
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout Nyxplorer
+      uses: actions/checkout@v6
+      with:
+        path: nyxplorer-repo
+    - name: Checkout upstream main
+      uses: actions/checkout@v6
+      with:
+        repository: files-community/Files
+        path: upstream
+    - name: Setup Node (renders Nyxplorer.svg)
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - name: Dry-run Nyxplorer branding
+      id: dryrun
+      shell: pwsh
+      run: |
+        & "${{ github.workspace }}\nyxplorer-repo\nyxplorer\scripts\Apply-NyxplorerBranding.ps1" -SourceRoot "${{ github.workspace }}\upstream" -Version "1.0.0.0"
+    - name: Report branding breakage
+      if: failure() && steps.dryrun.outcome == 'failure'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        title="Upstream main changed code that Nyxplorer branding patches"
+        existing=$(gh issue list --repo "${{ github.repository }}" --state open --search "$title in:title" --json number --jq 'length')
+        if [ "$existing" = "0" ]; then
+          gh issue create --repo "${{ github.repository }}" --title "$title" --body "nyxplorer/scripts/Apply-NyxplorerBranding.ps1 no longer applies cleanly to upstream main. This will block the next Nyxplorer release once upstream ships it. Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        fi
+      shell: bash
+
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.check.outputs.ref }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+    - name: Look for a new upstream stable release
+      id: check
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        ref=$(gh api repos/files-community/Files/releases/latest --jq .tag_name)
+        echo "ref=$ref" >> "$GITHUB_OUTPUT"
+        built=$(gh api "repos/${{ github.repository }}/releases?per_page=100" --jq "[.[] | select(.body | contains(\"[Files $ref]\"))] | length")
+        if [ "$built" = "0" ]; then
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "Upstream $ref has no Nyxplorer release yet; building."
+        else
+          echo "build=false" >> "$GITHUB_OUTPUT"
+          echo "Nyxplorer is already built from upstream $ref."
+        fi
+
+  release:
+    needs: check-release
+    if: needs.check-release.outputs.build == 'true'
+    uses: ./.github/workflows/nyxplorer-release.yml
+    with:
+      upstream_ref: ${{ needs.check-release.outputs.ref }}
+      publish: true
+    secrets: inherit
