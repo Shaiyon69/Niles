@@ -64,8 +64,10 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         ref=$(gh api repos/files-community/Files/releases/latest --jq .tag_name)
+        if [ -z "$ref" ]; then echo "Could not resolve the latest upstream release" >&2; exit 1; fi
         echo "ref=$ref" >> "$GITHUB_OUTPUT"
-        built=$(gh api "repos/${{ github.repository }}/releases?per_page=100" --jq "[.[] | select(.body | contains(\"[Files $ref]\"))] | length")
+        # Published releases only: a leftover draft must not block a rebuild
+        built=$(gh api --paginate "repos/${{ github.repository }}/releases?per_page=100" --jq ".[] | select(.draft == false and ((.body // \"\") | contains(\"[Files $ref]\"))) | .id" | wc -l | tr -d ' ')
         if [ "$built" = "0" ]; then
           echo "build=true" >> "$GITHUB_OUTPUT"
           echo "Upstream $ref has no Nyxplorer release yet; building."
@@ -82,3 +84,18 @@ jobs:
       upstream_ref: ${{ needs.check-release.outputs.ref }}
       publish: true
     secrets: inherit
+
+  report-release-failure:
+    needs: release
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Open an issue for the failed release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        title="Automatic Nyxplorer release failed"
+        existing=$(gh issue list --repo "${{ github.repository }}" --state open --search "$title in:title" --json number --jq 'length')
+        if [ "$existing" = "0" ]; then
+          gh issue create --repo "${{ github.repository }}" --title "$title" --body "Building Nyxplorer from the latest upstream Files release failed. The sync retries daily. Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        fi

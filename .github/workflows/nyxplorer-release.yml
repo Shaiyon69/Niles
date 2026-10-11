@@ -33,7 +33,9 @@ concurrency:
 jobs:
   build:
     runs-on: windows-2025-vs2026
+    timeout-minutes: 120
     env:
+      NYXPLORER_CERT_PASSWORD: ${{ secrets.NYXPLORER_CERT_PASSWORD }}
       CONFIGURATION: Release
       PLATFORM: x64
       NYXPLORER_DIR: '${{ github.workspace }}\nyxplorer-repo'
@@ -54,11 +56,16 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         INPUT_REF: ${{ inputs.upstream_ref }}
+        NYXPLORER_CERT_PFX: ${{ secrets.NYXPLORER_CERT_PFX }}
       run: |
+        # Fail fast, before the long build
+        if (-not $env:NYXPLORER_CERT_PFX) { throw "Secret NYXPLORER_CERT_PFX is missing. Run nyxplorer/scripts/New-NyxplorerCertificate.ps1 once (see README)." }
+        if (-not $env:NYXPLORER_CERT_PASSWORD) { throw "Secret NYXPLORER_CERT_PASSWORD is missing." }
         $config = Get-Content "$env:NYXPLORER_DIR\nyxplorer\nyxplorer.config.json" -Raw | ConvertFrom-Json
         $ref = $env:INPUT_REF
         if (-not $ref) { $ref = gh api "repos/$($config.upstreamRepository)/releases/latest" --jq .tag_name }
         if (-not $ref) { throw "Could not resolve the latest upstream release" }
+        if ($ref -notmatch '^[A-Za-z0-9._/-]+$') { throw "Invalid upstream ref '$ref'" }
         "ref=$ref" >> $env:GITHUB_OUTPUT
         "upstream=$($config.upstreamRepository)" >> $env:GITHUB_OUTPUT
         Write-Host "Building upstream $($config.upstreamRepository)@$ref"
@@ -120,7 +127,6 @@ jobs:
       env:
         NYXPLORER_CERT_PFX: ${{ secrets.NYXPLORER_CERT_PFX }}
       run: |
-        if (-not $env:NYXPLORER_CERT_PFX) { throw "Secret NYXPLORER_CERT_PFX is missing. Run nyxplorer/scripts/New-NyxplorerCertificate.ps1 once (see README)." }
         [IO.File]::WriteAllBytes($env:PFX_PATH, [Convert]::FromBase64String($env:NYXPLORER_CERT_PFX))
 
     - name: Restore
@@ -138,7 +144,7 @@ jobs:
         msbuild "src\Files.App.Launcher\Files.App.Launcher.vcxproj" -t:Build -p:Platform=$env:PLATFORM -p:Configuration=$env:CONFIGURATION -v:quiet
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         $launchers = Get-ChildItem "src\Files.App\Assets\FilesOpenDialog" -Filter *.exe | ForEach-Object FullName
-        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $launchers -PfxPath $env:PFX_PATH -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}"
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $launchers -PfxPath $env:PFX_PATH -PfxPassword $env:NYXPLORER_CERT_PASSWORD
 
     - name: Build and package Nyxplorer
       shell: pwsh
@@ -166,7 +172,8 @@ jobs:
           -PackageManifestPath "src\Files.App\Package.appxmanifest" `
           -BuildMode "SideloadOnly"
         $bundle = Get-ChildItem "$env:APPX_PACKAGE_DIR" -Recurse -Filter *.msixbundle | Select-Object -First 1
-        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $bundle.FullName -PfxPath $env:PFX_PATH -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}"
+        if (-not $bundle) { throw "No .msixbundle was produced under $env:APPX_PACKAGE_DIR" }
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $bundle.FullName -PfxPath $env:PFX_PATH -PfxPassword $env:NYXPLORER_CERT_PASSWORD
 
     - name: Collect release files
       shell: pwsh
@@ -175,7 +182,7 @@ jobs:
           -SourceRoot "$env:SOURCE_DIR" `
           -AppxPackageDir "$env:APPX_PACKAGE_DIR" `
           -PfxPath "$env:PFX_PATH" `
-          -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}" `
+          -PfxPassword $env:NYXPLORER_CERT_PASSWORD `
           -OutDir "$env:OUT_DIR" `
           -Version "${{ steps.version.outputs.version }}" `
           -Tag "${{ steps.version.outputs.tag }}" `
@@ -185,6 +192,7 @@ jobs:
       shell: pwsh
       run: |
         choco install innosetup -y --no-progress | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Installing Inno Setup failed" }
         $iscc = Get-ChildItem "${env:ProgramFiles(x86)}", "$env:ProgramFiles", "$env:LOCALAPPDATA\Programs" -Filter ISCC.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue |
           Select-Object -First 1 -ExpandProperty FullName
         if (-not $iscc) { throw "Inno Setup compiler (ISCC.exe) not found" }
@@ -200,8 +208,47 @@ jobs:
           "/DOutputDir=$env:OUT_DIR\release" `
           "$env:NYXPLORER_DIR\nyxplorer\installer\Nyxplorer.iss"
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        $setup = Get-ChildItem "$env:OUT_DIR\release" -Filter "Nyxplorer-Setup-*.exe" | ForEach-Object FullName
-        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $setup -PfxPath $env:PFX_PATH -PfxPassword "${{ secrets.NYXPLORER_CERT_PASSWORD }}"
+        $setup = @(Get-ChildItem "$env:OUT_DIR\release" -Filter "Nyxplorer-Setup-*.exe" | ForEach-Object FullName)
+        if ($setup.Count -ne 1) { throw "Expected exactly one Nyxplorer-Setup-*.exe, found $($setup.Count)" }
+        & "$env:NYXPLORER_DIR\nyxplorer\scripts\Invoke-NyxplorerSign.ps1" -Path $setup -PfxPath $env:PFX_PATH -PfxPassword $env:NYXPLORER_CERT_PASSWORD
+
+    - name: Verify release files
+      shell: pwsh
+      run: |
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $release = "$env:OUT_DIR\release"
+        $version = "${{ steps.version.outputs.version }}"
+        $pfx = New-Object Security.Cryptography.X509Certificates.X509Certificate2($env:PFX_PATH, $env:NYXPLORER_CERT_PASSWORD)
+
+        foreach ($name in "Nyxplorer-Setup-$version-x64.exe", "Nyxplorer_${version}_x64.msixbundle", "Nyxplorer.appinstaller", "Nyxplorer.cer") {
+          $file = Join-Path $release $name
+          if (-not (Test-Path $file) -or (Get-Item $file).Length -eq 0) { throw "Missing or empty release file: $name" }
+        }
+
+        # Setup must carry our signature (same certificate every release, or in-place updates break)
+        $sig = Get-AuthenticodeSignature "$release\Nyxplorer-Setup-$version-x64.exe"
+        if (-not $sig.SignerCertificate -or $sig.SignerCertificate.Thumbprint -ne $pfx.Thumbprint) { throw "Setup is not signed with the Nyxplorer certificate (status $($sig.Status))" }
+
+        # Bundle must be signed and carry the expected identity and version
+        $zip = [IO.Compression.ZipFile]::OpenRead("$release\Nyxplorer_${version}_x64.msixbundle")
+        try {
+          if (-not ($zip.Entries | Where-Object FullName -eq "AppxSignature.p7x")) { throw "msixbundle is not signed" }
+          $entry = $zip.Entries | Where-Object FullName -eq "AppxMetadata/AppxBundleManifest.xml" | Select-Object -First 1
+          if (-not $entry) { throw "msixbundle has no AppxBundleManifest.xml" }
+          $reader = New-Object IO.StreamReader($entry.Open())
+          [xml]$bundleManifest = $reader.ReadToEnd()
+          $reader.Close()
+        }
+        finally { $zip.Dispose() }
+        $identity = $bundleManifest.Bundle.Identity
+        if ($identity.Version -ne $version) { throw "msixbundle version $($identity.Version) does not match $version" }
+        if ($identity.Publisher -ne $pfx.Subject) { throw "msixbundle publisher '$($identity.Publisher)' does not match certificate '$($pfx.Subject)'" }
+
+        # appinstaller must parse and point at this release's bundle
+        [xml]$appInstaller = Get-Content "$release\Nyxplorer.appinstaller"
+        if ($appInstaller.AppInstaller.Version -ne $version -or $appInstaller.AppInstaller.MainBundle.Name -ne $identity.Name) { throw "Nyxplorer.appinstaller does not match the bundle" }
+
+        Write-Host "Release files verified for $version"
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v7
@@ -224,10 +271,29 @@ jobs:
 
         Installed copies update themselves from this page. Source for this release: https://github.com/${{ github.repository }}
         "@
-        gh release create "${{ steps.version.outputs.tag }}" (Get-ChildItem "$env:OUT_DIR\release" | ForEach-Object FullName) `
+        $tag = "${{ steps.version.outputs.tag }}"
+        $files = @(Get-ChildItem "$env:OUT_DIR\release" | ForEach-Object FullName)
+
+        # Draft first: "latest" (used by in-app updates) must never point at a release with missing assets
+        gh release create $tag $files `
+          --draft `
           --target "${{ github.sha }}" `
           --title "Nyxplorer ${{ steps.version.outputs.display }}" `
           --notes $notes
+        if ($LASTEXITCODE -ne 0) {
+          gh release delete $tag --yes --cleanup-tag 2>$null
+          throw "Creating the draft release failed"
+        }
+
+        $uploaded = @(gh release view $tag --json assets --jq '.assets[].name')
+        $missing = @($files | ForEach-Object { Split-Path $_ -Leaf } | Where-Object { $_ -notin $uploaded })
+        if ($missing.Count -gt 0) {
+          gh release delete $tag --yes --cleanup-tag 2>$null
+          throw "Release assets missing after upload: $($missing -join ', ')"
+        }
+
+        gh release edit $tag --draft=false --latest
+        if ($LASTEXITCODE -ne 0) { throw "Publishing release $tag failed; it remains a draft" }
 
     - name: Remove signing certificate
       if: always()

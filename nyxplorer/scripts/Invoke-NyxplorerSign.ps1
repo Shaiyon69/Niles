@@ -19,8 +19,21 @@ $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurs
     Select-Object -First 1
 if (-not $signtool) { throw "signtool.exe not found in the Windows SDK" }
 
+$timestampServers = "http://timestamp.digicert.com", "http://timestamp.sectigo.com", "http://timestamp.globalsign.com/tsa/r6advanced1"
+
 foreach ($file in $Path) {
-    & $signtool.FullName sign /fd SHA256 /f $PfxPath /p $PfxPassword /tr "http://timestamp.digicert.com" /td SHA256 $file
-    if ($LASTEXITCODE -ne 0) { throw "signtool failed for $file" }
+    if (-not (Test-Path $file)) { throw "Cannot sign missing file $file" }
+    $signed = $false
+    # Timestamp servers are flaky: try each one, twice
+    foreach ($attempt in 1..2) {
+        foreach ($server in $timestampServers) {
+            & $signtool.FullName sign /fd SHA256 /f $PfxPath /p $PfxPassword /tr $server /td SHA256 $file
+            if ($LASTEXITCODE -eq 0) { $signed = $true; break }
+            Write-Warning "signtool failed for $file using $server (exit $LASTEXITCODE)"
+        }
+        if ($signed) { break }
+        Start-Sleep -Seconds 5
+    }
+    if (-not $signed) { throw "signtool failed for $file" }
     Write-Host "Signed $file"
 }
